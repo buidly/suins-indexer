@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:latest
+    environment:
+      - POSTGRES_USER=root
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=microservice
+    ports:
+      - "5432:5432"
+
+  pgweb:
+    image: sosedoff/pgweb
+    ports:
+      - "8081:8081"
+    environment:
+      - PGWEB_DATABASE_URL=postgres://root:password@postgres:5432/microservice?sslmode=disable
+    depends_on:
+      - postgres
+    restart: always
