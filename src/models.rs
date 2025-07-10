@@ -22,7 +22,6 @@ impl EventsCursor {
     }
 }
 
-
 #[derive(Queryable, Selectable, Insertable, AsChangeset, Debug, FieldCount, Clone)]
 #[diesel(table_name = offer_placed)]
 #[diesel(check_for_backend(diesel::pg::Pg))]

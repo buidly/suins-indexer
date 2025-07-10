@@ -15,6 +15,11 @@ use diesel_async::RunQueryDsl;
 use crate::models::{EventsCursor, OfferCancelled, OfferPlaced};
 use crate::schema::{events_cursor, offer_cancelled, offer_placed};
 
+pub enum OfferEvent {
+    Placed(OfferPlaced),
+    Cancelled(OfferCancelled),
+}
+
 #[derive(serde::Deserialize, Debug)]
 pub struct OfferPlacedEvent {
     domain_name: Vec<u8>,
@@ -51,12 +56,21 @@ impl OfferHandler {
         String::from_utf8_lossy(domain_name).to_string()
     }
 
-    fn process_event(&self, event: &Event, tx_digest: &str) -> Result<Option<(OfferPlaced, OfferCancelled)>> {
+    fn try_deserialize_offer_placed_event(&self, contents: &[u8]) -> Result<OfferPlacedEvent, anyhow::Error> {
+        match from_bytes::<OfferPlacedEvent>(contents) {
+            Ok(event) => Ok(event),
+            Err(e) => {
+                error!("Failed to deserialize as OfferPlacedEvent: {}. Event contents: {:?}", e, contents);
+                Err(e.into())
+            }
+        }
+    }
+
+    fn process_event(&self, event: &Event, tx_digest: &str) -> Result<Option<OfferEvent>> {
         let event_type = event.type_.to_string();
         if event_type.contains(&self.contract_package_id) {
             if event_type.ends_with("::OfferPlacedEvent") {
-                let offer_event: OfferPlacedEvent = from_bytes(&event.contents)?;
-                
+                let offer_event = self.try_deserialize_offer_placed_event(&event.contents)?;
                 let offer = OfferPlaced {
                     domain_name: Self::convert_domain_name(&offer_event.domain_name),
                     address: offer_event.address.to_string(),
@@ -64,30 +78,9 @@ impl OfferHandler {
                     created_at: chrono::Utc::now(),
                     tx_digest: tx_digest.to_string(),
                 };
-
-                return Ok(Some((offer, OfferCancelled {
-                    domain_name: String::new(),
-                    address: String::new(),
-                    value: String::new(),
-                    created_at: chrono::Utc::now(),
-                    tx_digest: String::new(),
-                })));
+                return Ok(Some(OfferEvent::Placed(offer)));
             } else if event_type.ends_with("::OfferCancelledEvent") {
-                info!("Processing OfferCancelledEvent with {} bytes of data", event.contents.len());
-                info!("Event contents: {:?}", event.contents);
-                
-                match from_bytes::<OfferPlacedEvent>(&event.contents) {
-                    Ok(test_event) => {
-                        info!("Successfully deserialized as OfferPlacedEvent: domain={}, address={}, value={}", 
-                              String::from_utf8_lossy(&test_event.domain_name), test_event.address, test_event.value);
-                    },
-                    Err(e) => {
-                        error!("Failed to deserialize as OfferPlacedEvent: {}", e);
-                    }
-                }
-                
-                let cancel_event: OfferCancelledEvent = from_bytes(&event.contents)?;
-                
+                let cancel_event = self.try_deserialize_offer_placed_event(&event.contents);
                 let cancellation = OfferCancelled {
                     domain_name: Self::convert_domain_name(&cancel_event.domain_name),
                     address: cancel_event.address.to_string(),
@@ -95,14 +88,7 @@ impl OfferHandler {
                     created_at: chrono::Utc::now(),
                     tx_digest: tx_digest.to_string(),
                 };
-
-                return Ok(Some((OfferPlaced {
-                    domain_name: String::new(),
-                    address: String::new(),
-                    value: String::new(),
-                    created_at: chrono::Utc::now(),
-                    tx_digest: String::new(),
-                }, cancellation)));
+                return Ok(Some(OfferEvent::Cancelled(cancellation)));
             }
         }
         Ok(None)
@@ -201,16 +187,13 @@ impl Processor for OfferHandler {
 
     fn process(&self, checkpoint: &Arc<CheckpointData>) -> anyhow::Result<Vec<Self::Value>> {
         info!("Starting process method for checkpoint {}", checkpoint.checkpoint_summary.sequence_number);
-        
         let mut offers = Vec::new();
         let mut cancellations = Vec::new();
-
         info!(
             "Processing checkpoint {} with {} transactions",
             checkpoint.checkpoint_summary.sequence_number,
             checkpoint.transactions.len()
         );
- 
         for tx in &checkpoint.transactions {
             let tx_digest = tx.transaction.digest().to_string();
             if let Some(events) = &tx.events {
@@ -222,15 +205,13 @@ impl Processor for OfferHandler {
                         );
                     }
                     match self.process_event(event, &tx_digest) {
-                        Ok(Some((offer, cancellation))) => {
-                            if !offer.domain_name.is_empty() {
-                                info!("Processing offer for domain: {}", offer.domain_name);
-                                offers.push(offer);
-                            }
-                            if !cancellation.domain_name.is_empty() {
-                                info!("Processing cancelled offer for domain: {}", cancellation.domain_name);
-                                cancellations.push(cancellation);
-                            }
+                        Ok(Some(OfferEvent::Placed(offer))) => {
+                            info!("Processing offer for domain: {}", offer.domain_name);
+                            offers.push(offer);
+                        },
+                        Ok(Some(OfferEvent::Cancelled(cancellation))) => {
+                            info!("Processing cancelled offer for domain: {}", cancellation.domain_name);
+                            cancellations.push(cancellation);
                         },
                         Ok(None) => {
                             // No event to process
@@ -243,26 +224,22 @@ impl Processor for OfferHandler {
                 }
             }
         }
-
         info!(
             "Processed checkpoint {}: {} offers, {} cancellations",
             checkpoint.checkpoint_summary.sequence_number,
             offers.len(),
             cancellations.len()
         );
-
         let result = vec![OfferHandlerValue {
             offers,
             cancellations,
             checkpoint: checkpoint.checkpoint_summary.sequence_number,
         }];
-        
         info!("Returning {} handler values from process method", result.len());
         for (i, value) in result.iter().enumerate() {
             info!("Handler value {}: {} offers, {} cancellations, checkpoint {}", 
                   i, value.offers.len(), value.cancellations.len(), value.checkpoint);
         }
-
         info!("Process method completed successfully");
         Ok(result)
     }
