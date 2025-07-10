@@ -1,19 +1,19 @@
-use anyhow::Result;
+use anyhow::Context;
+use async_trait::async_trait;
+use diesel::internal::derives::multiconnection::chrono::{DateTime, Utc};
+use diesel_async::RunQueryDsl;
+use std::sync::Arc;
+use sui_indexer_alt_framework::db::{Connection, Db};
 use sui_indexer_alt_framework::pipeline::concurrent::Handler;
 use sui_indexer_alt_framework::pipeline::Processor;
-use sui_types::event::Event;
-use chrono;
-use async_trait::async_trait;
-use sui_pg_db::{Connection, Db};
-use sui_types::full_checkpoint_content::CheckpointData;
-use std::sync::Arc;
-use tracing::{error, info};
+use sui_indexer_alt_framework::types::full_checkpoint_content::CheckpointData;
 use sui_indexer_alt_framework::FieldCount;
-use bcs::from_bytes;
-use diesel_async::RunQueryDsl;
+use sui_indexer_alt_framework::Result;
+use sui_types::event::Event;
+use log::{error, info};
 
-use crate::models::{EventsCursor, OfferCancelled, OfferPlaced};
-use crate::schema::{events_cursor, offer_cancelled, offer_placed};
+use crate::models::{OfferCancelled, OfferPlaced};
+use crate::schema::{offer_cancelled, offer_placed};
 
 pub enum OfferEvent {
     Placed(OfferPlaced),
@@ -41,101 +41,81 @@ pub struct OfferHandlerValue {
     pub checkpoint: u64,
 }
 
-pub struct OfferHandler {
+pub struct OfferHandlerPipeline {
     contract_package_id: String,
 }
 
-impl OfferHandler {
-    pub fn new(contract_package_id: String) -> Self {
-        Self {
-            contract_package_id,
-        }
-    }
+impl Processor for OfferHandlerPipeline {
+    const NAME: &'static str = "Offer";
 
-    fn convert_domain_name(domain_name: &[u8]) -> String {
-        String::from_utf8_lossy(domain_name).to_string()
-    }
+    type Value = OfferHandlerValue;
 
-    fn try_deserialize_offer_placed_event(&self, contents: &[u8]) -> Result<OfferPlacedEvent, anyhow::Error> {
-        match from_bytes::<OfferPlacedEvent>(contents) {
-            Ok(event) => Ok(event),
-            Err(e) => {
-                error!("Failed to deserialize as OfferPlacedEvent: {}. Event contents: {:?}", e, contents);
-                Err(e.into())
+    fn process(&self, checkpoint: &Arc<CheckpointData>) -> Result<Vec<Self::Value>> {
+        let timestamp_ms: u64 = checkpoint.checkpoint_summary.timestamp_ms.into();
+        let timestamp_i64 =
+            i64::try_from(timestamp_ms).context("Timestamp too large to convert to i64")?;
+        let created_at: DateTime<Utc> =
+            DateTime::<Utc>::from_timestamp_millis(timestamp_i64).context("invalid timestamp")?;
+
+        let checkpoint_id: i64 = checkpoint.checkpoint_summary.sequence_number.try_into()?;
+
+        let mut offers = Vec::new();
+        let mut cancellations = Vec::new();
+
+        for tx in &checkpoint.transactions {
+            let tx_digest = tx.transaction.digest().to_string();
+            if let Some(events) = &tx.events {
+                for event in &events.data {
+                    match self.process_event(event, &tx_digest, created_at) {
+                        Ok(Some(OfferEvent::Placed(offer))) => {
+                            info!("Processing offer for domain: {}", offer.domain_name);
+                            offers.push(offer);
+                        }
+                        Ok(Some(OfferEvent::Cancelled(cancellation))) => {
+                            info!(
+                                "Processing cancelled offer for domain: {}",
+                                cancellation.domain_name
+                            );
+                            cancellations.push(cancellation);
+                        }
+                        Ok(None) => {
+                            // No event to process
+                        }
+                        Err(e) => {
+                            error!("Error processing event: {}", e);
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
-    }
 
-    fn process_event(&self, event: &Event, tx_digest: &str) -> Result<Option<OfferEvent>> {
-        let event_type = event.type_.to_string();
-        if event_type.contains(&self.contract_package_id) {
-            if event_type.ends_with("::OfferPlacedEvent") {
-                let offer_event = self.try_deserialize_offer_placed_event(&event.contents)?;
-                let offer = OfferPlaced {
-                    domain_name: Self::convert_domain_name(&offer_event.domain_name),
-                    address: offer_event.address.to_string(),
-                    value: offer_event.value.to_string(),
-                    created_at: chrono::Utc::now(),
-                    tx_digest: tx_digest.to_string(),
-                };
-                return Ok(Some(OfferEvent::Placed(offer)));
-            } else if event_type.ends_with("::OfferCancelledEvent") {
-                let cancel_event = self.try_deserialize_offer_placed_event(&event.contents);
-                let cancellation = OfferCancelled {
-                    domain_name: Self::convert_domain_name(&cancel_event.domain_name),
-                    address: cancel_event.address.to_string(),
-                    value: cancel_event.value.to_string(),
-                    created_at: chrono::Utc::now(),
-                    tx_digest: tx_digest.to_string(),
-                };
-                return Ok(Some(OfferEvent::Cancelled(cancellation)));
-            }
-        }
-        Ok(None)
+        let result = vec![OfferHandlerValue {
+            offers,
+            cancellations,
+            checkpoint: checkpoint.checkpoint_summary.sequence_number,
+        }];
+
+        Ok(result)
     }
 }
 
 #[async_trait]
-impl Handler for OfferHandler {
+impl Handler for OfferHandlerPipeline {
     type Store = Db;
 
-    async fn commit<'a>(
-        values: &[Self::Value],
-        conn: &mut Connection<'a>,
-    ) -> anyhow::Result<usize> {
+    async fn commit<'a>(values: &[Self::Value], conn: &mut Connection<'a>) -> Result<usize> {
         let mut changes = 0usize;
 
-        info!("Starting commit with {} value batches", values.len());
-
         for (i, value) in values.iter().enumerate() {
-            info!("Processing batch {}: {} offers, {} cancellations", i, value.offers.len(), value.cancellations.len());
-            
-            // Collect all event cursors 
-            let event_cursors: Vec<EventsCursor> = 
-                value.offers.iter().map(|e| &e.tx_digest)
-                .chain(value.cancellations.iter().map(|e| &e.tx_digest))
-                .map(|tx_digest| EventsCursor::from_event(value.checkpoint, tx_digest))
-                .collect();
-
-            info!("Created {} event cursors", event_cursors.len());
-
-            if !event_cursors.is_empty() {
-                info!("Inserting {} event cursors", event_cursors.len());
-                match diesel::insert_into(events_cursor::table)
-                    .values(&event_cursors)
-                    .execute(conn)
-                    .await
-                {
-                    Ok(count) => info!("Successfully inserted {} event cursors", count),
-                    Err(e) => error!("Failed to insert event cursors: {}", e),
-                }
-            }
-
             // Store offers
             if !value.offers.is_empty() {
                 info!("Inserting {} offers", value.offers.len());
                 for (j, offer) in value.offers.iter().enumerate() {
-                    info!("Offer {}: domain={}, address={}, value={}", j, offer.domain_name, offer.address, offer.value);
+                    info!(
+                        "Offer {}: domain={}, address={}, value={}",
+                        j, offer.domain_name, offer.address, offer.value
+                    );
                 }
                 match diesel::insert_into(offer_placed::table)
                     .values(&value.offers)
@@ -145,7 +125,7 @@ impl Handler for OfferHandler {
                     Ok(count) => {
                         info!("Successfully inserted {} offers", count);
                         changes += count;
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to insert offers: {}", e);
                         return Err(e.into());
@@ -157,7 +137,10 @@ impl Handler for OfferHandler {
             if !value.cancellations.is_empty() {
                 info!("Inserting {} cancellations", value.cancellations.len());
                 for (j, cancellation) in value.cancellations.iter().enumerate() {
-                    info!("Cancellation {}: domain={}, address={}, value={}", j, cancellation.domain_name, cancellation.address, cancellation.value);
+                    info!(
+                        "Cancellation {}: domain={}, address={}, value={}",
+                        j, cancellation.domain_name, cancellation.address, cancellation.value
+                    );
                 }
                 match diesel::insert_into(offer_cancelled::table)
                     .values(&value.cancellations)
@@ -167,7 +150,7 @@ impl Handler for OfferHandler {
                     Ok(count) => {
                         info!("Successfully inserted {} cancellations", count);
                         changes += count;
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to insert cancellations: {}", e);
                         return Err(e.into());
@@ -176,129 +159,88 @@ impl Handler for OfferHandler {
             }
         }
 
-        info!("Commit completed with {} total changes", changes);
         Ok(changes)
     }
 }
 
-impl Processor for OfferHandler {
-    const NAME: &'static str = "Offer";
-    type Value = OfferHandlerValue;
+impl OfferHandlerPipeline {
+    pub fn new(contract_package_id: String) -> Self {
+        Self {
+            contract_package_id,
+        }
+    }
 
-    fn process(&self, checkpoint: &Arc<CheckpointData>) -> anyhow::Result<Vec<Self::Value>> {
-        info!("Starting process method for checkpoint {}", checkpoint.checkpoint_summary.sequence_number);
-        let mut offers = Vec::new();
-        let mut cancellations = Vec::new();
-        info!(
-            "Processing checkpoint {} with {} transactions",
-            checkpoint.checkpoint_summary.sequence_number,
-            checkpoint.transactions.len()
-        );
-        for tx in &checkpoint.transactions {
-            let tx_digest = tx.transaction.digest().to_string();
-            if let Some(events) = &tx.events {
-                for event in &events.data {
-                    if event.type_.to_string().ends_with("::OfferPlacedEvent") || event.type_.to_string().ends_with("::OfferCancelledEvent") {
-                        info!(
-                            "Event type: {} ",
-                            event.type_.to_string(),
-                        );
-                    }
-                    match self.process_event(event, &tx_digest) {
-                        Ok(Some(OfferEvent::Placed(offer))) => {
-                            info!("Processing offer for domain: {}", offer.domain_name);
-                            offers.push(offer);
-                        },
-                        Ok(Some(OfferEvent::Cancelled(cancellation))) => {
-                            info!("Processing cancelled offer for domain: {}", cancellation.domain_name);
-                            cancellations.push(cancellation);
-                        },
-                        Ok(None) => {
-                            // No event to process
-                        },
-                        Err(e) => {
-                            error!("Error processing event: {}", e);
-                            return Err(e);
-                        }
-                    }
-                }
+    fn process_event(
+        &self,
+        event: &Event,
+        tx_digest: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<Option<OfferEvent>> {
+        let event_type = event.type_.to_string();
+        if event_type.starts_with(&self.contract_package_id) {
+            info!("Found Auction event: {} ", event_type);
+
+            if event_type.ends_with("::OfferPlacedEvent") {
+                let offer_event = self.try_deserialize_offer_placed_event(&event.contents)?;
+                let offer = OfferPlaced {
+                    domain_name: Self::convert_domain_name(&offer_event.domain_name),
+                    address: offer_event.address.to_string(),
+                    value: offer_event.value.to_string(),
+                    created_at,
+                    tx_digest: tx_digest.to_string(),
+                };
+
+                return Ok(Some(OfferEvent::Placed(offer)));
+            } else if event_type.ends_with("::OfferCancelledEvent") {
+                let cancel_event = self.try_deserialize_offer_cancelled_event(&event.contents)?;
+                let cancellation = OfferCancelled {
+                    domain_name: Self::convert_domain_name(&cancel_event.domain_name),
+                    address: cancel_event.address.to_string(),
+                    value: cancel_event.value.to_string(),
+                    created_at,
+                    tx_digest: tx_digest.to_string(),
+                };
+
+                return Ok(Some(OfferEvent::Cancelled(cancellation)));
             }
         }
-        info!(
-            "Processed checkpoint {}: {} offers, {} cancellations",
-            checkpoint.checkpoint_summary.sequence_number,
-            offers.len(),
-            cancellations.len()
-        );
-        let result = vec![OfferHandlerValue {
-            offers,
-            cancellations,
-            checkpoint: checkpoint.checkpoint_summary.sequence_number,
-        }];
-        info!("Returning {} handler values from process method", result.len());
-        for (i, value) in result.iter().enumerate() {
-            info!("Handler value {}: {} offers, {} cancellations, checkpoint {}", 
-                  i, value.offers.len(), value.cancellations.len(), value.checkpoint);
+
+        Ok(None)
+    }
+
+    fn try_deserialize_offer_placed_event(
+        &self,
+        contents: &[u8],
+    ) -> Result<OfferPlacedEvent, anyhow::Error> {
+        match bcs::from_bytes::<OfferPlacedEvent>(contents) {
+            Ok(event) => Ok(event),
+            Err(e) => {
+                error!(
+                    "Failed to deserialize as OfferPlacedEvent: {}. Event contents: {:?}",
+                    e, contents
+                );
+                Err(e.into())
+            }
         }
-        info!("Process method completed successfully");
-        Ok(result)
+    }
+
+    fn try_deserialize_offer_cancelled_event(
+        &self,
+        contents: &[u8],
+    ) -> Result<OfferCancelledEvent, anyhow::Error> {
+        match bcs::from_bytes::<OfferCancelledEvent>(contents) {
+            Ok(event) => Ok(event),
+            Err(e) => {
+                error!(
+                    "Failed to deserialize as OfferPlacedEvent: {}. Event contents: {:?}",
+                    e, contents
+                );
+                Err(e.into())
+            }
+        }
+    }
+
+    fn convert_domain_name(domain_name: &[u8]) -> String {
+        String::from_utf8_lossy(domain_name).to_string()
     }
 }
-
-pub async fn handle_offer_placed(
-    conn: &mut diesel_async::AsyncPgConnection,
-    event: &OfferPlacedEvent,
-    tx_digest: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let new_offer = OfferPlaced {
-        domain_name: String::from_utf8_lossy(&event.domain_name).to_string(),
-        address: event.address.to_string(),
-        value: event.value.to_string(),
-        created_at: chrono::Utc::now(),
-        tx_digest: tx_digest.to_string(),
-    };
-
-    match diesel::insert_into(offer_placed::table)
-        .values(&new_offer)
-        .execute(conn)
-        .await
-    {
-        Ok(_) => {
-            info!("Successfully inserted offer placed for domain: {}", new_offer.domain_name);
-            Ok(())
-        }
-        Err(e) => {
-            error!("Error inserting offer placed: {}", e);
-            Err(Box::new(e))
-        }
-    }
-}
-
-pub async fn handle_offer_cancelled(
-    conn: &mut diesel_async::AsyncPgConnection,
-    event: &OfferCancelledEvent,
-    tx_digest: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let cancelled_offer = OfferCancelled {
-        domain_name: String::from_utf8_lossy(&event.domain_name).to_string(),
-        address: event.address.to_string(),
-        value: event.value.to_string(),
-        created_at: chrono::Utc::now(),
-        tx_digest: tx_digest.to_string(),
-    };
-
-    match diesel::insert_into(offer_cancelled::table)
-        .values(&cancelled_offer)
-        .execute(conn)
-        .await
-    {
-        Ok(_) => {
-            info!("Successfully inserted offer cancelled for domain: {}", cancelled_offer.domain_name);
-            Ok(())
-        }
-        Err(e) => {
-            error!("Error inserting offer cancelled: {}", e);
-            Err(Box::new(e))
-        }
-    }
-} 
