@@ -1,3 +1,7 @@
+use crate::events::{
+    convert_domain_name, try_deserialize_event, AcceptCounterOfferEvent, MakeCounterOfferEvent,
+    OfferAcceptedEvent, OfferCancelledEvent, OfferDeclinedEvent, OfferPlacedEvent,
+};
 use crate::models::{
     AcceptCounterOffer, MakeCounterOffer, OfferAccepted, OfferCancelled, OfferDeclined, OfferPlaced,
 };
@@ -10,7 +14,6 @@ use async_trait::async_trait;
 use diesel::internal::derives::multiconnection::chrono::{DateTime, Utc};
 use diesel_async::RunQueryDsl;
 use log::{error, info};
-use serde::Deserialize;
 use std::sync::Arc;
 use sui_indexer_alt_framework::db::{Connection, Db};
 use sui_indexer_alt_framework::pipeline::concurrent::Handler;
@@ -20,60 +23,13 @@ use sui_indexer_alt_framework::FieldCount;
 use sui_indexer_alt_framework::Result;
 use sui_types::event::Event;
 
-pub enum OfferEvent {
+pub enum OfferEventModel {
     Placed(OfferPlaced),
     Cancelled(OfferCancelled),
     Accepted(OfferAccepted),
     Declined(OfferDeclined),
     MakeCounterOffer(MakeCounterOffer),
     AcceptCounterOffer(AcceptCounterOffer),
-}
-
-#[derive(serde::Deserialize, Debug)]
-pub struct OfferPlacedEvent {
-    domain_name: Vec<u8>,
-    address: sui_types::base_types::SuiAddress,
-    value: u64,
-}
-
-#[derive(serde::Deserialize, Debug)]
-pub struct OfferCancelledEvent {
-    domain_name: Vec<u8>,
-    address: sui_types::base_types::SuiAddress,
-    value: u64,
-}
-
-#[derive(serde::Deserialize, Debug)]
-pub struct OfferAcceptedEvent {
-    domain_name: Vec<u8>,
-    owner: sui_types::base_types::SuiAddress,
-    buyer: sui_types::base_types::SuiAddress,
-    value: u64,
-}
-
-#[derive(serde::Deserialize, Debug)]
-pub struct OfferDeclinedEvent {
-    domain_name: Vec<u8>,
-    owner: sui_types::base_types::SuiAddress,
-    buyer: sui_types::base_types::SuiAddress,
-    value: u64,
-}
-
-// owner can create a counter offer
-#[derive(serde::Deserialize, Debug)]
-pub struct MakeCounterOfferEvent {
-    domain_name: Vec<u8>,
-    owner: sui_types::base_types::SuiAddress,
-    buyer: sui_types::base_types::SuiAddress,
-    value: u64,
-}
-
-// buyer can accept counter offer
-#[derive(serde::Deserialize, Debug)]
-pub struct AcceptCounterOfferEvent {
-    domain_name: Vec<u8>,
-    buyer: sui_types::base_types::SuiAddress,
-    value: u64,
 }
 
 #[derive(FieldCount)]
@@ -87,12 +43,12 @@ pub struct OfferHandlerValue {
     pub checkpoint: u64,
 }
 
-pub struct OfferHandlerPipeline {
+pub struct OfferEventsHandlerPipeline {
     contract_package_id: String,
 }
 
-impl Processor for OfferHandlerPipeline {
-    const NAME: &'static str = "Offer";
+impl Processor for OfferEventsHandlerPipeline {
+    const NAME: &'static str = "offer_events";
 
     type Value = OfferHandlerValue;
 
@@ -115,39 +71,39 @@ impl Processor for OfferHandlerPipeline {
             if let Some(events) = &tx.events {
                 for event in &events.data {
                     match self.process_event(event, &tx_digest, created_at) {
-                        Ok(Some(OfferEvent::Placed(offer))) => {
+                        Ok(Some(OfferEventModel::Placed(offer))) => {
                             info!("Processing placed offer for domain: {}", offer.domain_name);
                             placed.push(offer);
                         }
-                        Ok(Some(OfferEvent::Cancelled(offer))) => {
+                        Ok(Some(OfferEventModel::Cancelled(offer))) => {
                             info!(
                                 "Processing cancelled offer for domain: {}",
                                 offer.domain_name
                             );
                             cancelled.push(offer);
                         }
-                        Ok(Some(OfferEvent::Accepted(offer))) => {
+                        Ok(Some(OfferEventModel::Accepted(offer))) => {
                             info!(
                                 "Processing accepted offer for domain: {}",
                                 offer.domain_name
                             );
                             accepted.push(offer);
                         }
-                        Ok(Some(OfferEvent::Declined(offer))) => {
+                        Ok(Some(OfferEventModel::Declined(offer))) => {
                             info!(
                                 "Processing declined offer for domain: {}",
                                 offer.domain_name
                             );
                             declined.push(offer);
                         }
-                        Ok(Some(OfferEvent::MakeCounterOffer(offer))) => {
+                        Ok(Some(OfferEventModel::MakeCounterOffer(offer))) => {
                             info!(
                                 "Processing make counter offer for domain: {}",
                                 offer.domain_name
                             );
                             make_counter_offer.push(offer);
                         }
-                        Ok(Some(OfferEvent::AcceptCounterOffer(offer))) => {
+                        Ok(Some(OfferEventModel::AcceptCounterOffer(offer))) => {
                             info!(
                                 "Processing accept counter offer for domain: {}",
                                 offer.domain_name
@@ -181,7 +137,7 @@ impl Processor for OfferHandlerPipeline {
 }
 
 #[async_trait]
-impl Handler for OfferHandlerPipeline {
+impl Handler for OfferEventsHandlerPipeline {
     type Store = Db;
 
     async fn commit<'a>(values: &[Self::Value], conn: &mut Connection<'a>) -> Result<usize> {
@@ -351,7 +307,7 @@ impl Handler for OfferHandlerPipeline {
     }
 }
 
-impl OfferHandlerPipeline {
+impl OfferEventsHandlerPipeline {
     pub fn new(contract_package_id: String) -> Self {
         Self {
             contract_package_id,
@@ -363,40 +319,40 @@ impl OfferHandlerPipeline {
         event: &Event,
         tx_digest: &str,
         created_at: DateTime<Utc>,
-    ) -> Result<Option<OfferEvent>> {
+    ) -> Result<Option<OfferEventModel>> {
         let event_type = event.type_.to_string();
         if event_type.starts_with(&self.contract_package_id) {
             info!("Found Auction event: {} ", event_type);
 
             if event_type.ends_with("::OfferPlacedEvent") {
-                let offer_event: OfferPlacedEvent =
-                    self.try_deserialize_offer_event(&event.contents)?;
+                let offer_event: OfferPlacedEvent = try_deserialize_event(&event.contents)?;
+
                 let offer = OfferPlaced {
-                    domain_name: Self::convert_domain_name(&offer_event.domain_name),
+                    domain_name: convert_domain_name(&offer_event.domain_name),
                     address: offer_event.address.to_string(),
                     value: offer_event.value.to_string(),
                     created_at,
                     tx_digest: tx_digest.to_string(),
                 };
 
-                return Ok(Some(OfferEvent::Placed(offer)));
+                return Ok(Some(OfferEventModel::Placed(offer)));
             } else if event_type.ends_with("::OfferCancelledEvent") {
-                let cancel_event: OfferCancelledEvent =
-                    self.try_deserialize_offer_event(&event.contents)?;
+                let cancel_event: OfferCancelledEvent = try_deserialize_event(&event.contents)?;
+
                 let cancellation = OfferCancelled {
-                    domain_name: Self::convert_domain_name(&cancel_event.domain_name),
+                    domain_name: convert_domain_name(&cancel_event.domain_name),
                     address: cancel_event.address.to_string(),
                     value: cancel_event.value.to_string(),
                     created_at,
                     tx_digest: tx_digest.to_string(),
                 };
 
-                return Ok(Some(OfferEvent::Cancelled(cancellation)));
+                return Ok(Some(OfferEventModel::Cancelled(cancellation)));
             } else if event_type.ends_with("::OfferAcceptedEvent") {
-                let accepted_event: OfferAcceptedEvent =
-                    self.try_deserialize_offer_event(&event.contents)?;
+                let accepted_event: OfferAcceptedEvent = try_deserialize_event(&event.contents)?;
+
                 let accepted = OfferAccepted {
-                    domain_name: Self::convert_domain_name(&accepted_event.domain_name),
+                    domain_name: convert_domain_name(&accepted_event.domain_name),
                     address: accepted_event.buyer.to_string(),
                     owner: accepted_event.owner.to_string(),
                     value: accepted_event.value.to_string(),
@@ -404,12 +360,12 @@ impl OfferHandlerPipeline {
                     tx_digest: tx_digest.to_string(),
                 };
 
-                return Ok(Some(OfferEvent::Accepted(accepted)));
+                return Ok(Some(OfferEventModel::Accepted(accepted)));
             } else if event_type.ends_with("::OfferDeclinedEvent") {
-                let declined_event: OfferDeclinedEvent =
-                    self.try_deserialize_offer_event(&event.contents)?;
+                let declined_event: OfferDeclinedEvent = try_deserialize_event(&event.contents)?;
+
                 let decline = OfferDeclined {
-                    domain_name: Self::convert_domain_name(&declined_event.domain_name),
+                    domain_name: convert_domain_name(&declined_event.domain_name),
                     address: declined_event.buyer.to_string(),
                     owner: declined_event.owner.to_string(),
                     value: declined_event.value.to_string(),
@@ -417,12 +373,13 @@ impl OfferHandlerPipeline {
                     tx_digest: tx_digest.to_string(),
                 };
 
-                return Ok(Some(OfferEvent::Declined(decline)));
+                return Ok(Some(OfferEventModel::Declined(decline)));
             } else if event_type.ends_with("::MakeCounterOfferEvent") {
                 let make_counter_offer_event: MakeCounterOfferEvent =
-                    self.try_deserialize_offer_event(&event.contents)?;
+                    try_deserialize_event(&event.contents)?;
+
                 let make_counter_offer = MakeCounterOffer {
-                    domain_name: Self::convert_domain_name(&make_counter_offer_event.domain_name),
+                    domain_name: convert_domain_name(&make_counter_offer_event.domain_name),
                     address: make_counter_offer_event.buyer.to_string(),
                     owner: make_counter_offer_event.owner.to_string(),
                     value: make_counter_offer_event.value.to_string(),
@@ -430,42 +387,23 @@ impl OfferHandlerPipeline {
                     tx_digest: tx_digest.to_string(),
                 };
 
-                return Ok(Some(OfferEvent::MakeCounterOffer(make_counter_offer)));
+                return Ok(Some(OfferEventModel::MakeCounterOffer(make_counter_offer)));
             } else if event_type.ends_with("::AcceptCounterOfferEvent") {
                 let accept_counter_offer_event: AcceptCounterOfferEvent =
-                    self.try_deserialize_offer_event(&event.contents)?;
+                    try_deserialize_event(&event.contents)?;
+
                 let accept_counter_offer = AcceptCounterOffer {
-                    domain_name: Self::convert_domain_name(&accept_counter_offer_event.domain_name),
+                    domain_name: convert_domain_name(&accept_counter_offer_event.domain_name),
                     address: accept_counter_offer_event.buyer.to_string(),
                     value: accept_counter_offer_event.value.to_string(),
                     created_at,
                     tx_digest: tx_digest.to_string(),
                 };
 
-                return Ok(Some(OfferEvent::AcceptCounterOffer(accept_counter_offer)));
+                return Ok(Some(OfferEventModel::AcceptCounterOffer(accept_counter_offer)));
             }
         }
 
         Ok(None)
-    }
-
-    fn try_deserialize_offer_event<T: for<'a> Deserialize<'a>>(
-        &self,
-        contents: &[u8],
-    ) -> Result<T, anyhow::Error> {
-        match bcs::from_bytes::<T>(contents) {
-            Ok(event) => Ok(event),
-            Err(e) => {
-                error!(
-                    "Failed to deserialize: {}. Event contents: {:?}",
-                    e, contents
-                );
-                Err(e.into())
-            }
-        }
-    }
-
-    fn convert_domain_name(domain_name: &[u8]) -> String {
-        String::from_utf8_lossy(domain_name).to_string()
     }
 }

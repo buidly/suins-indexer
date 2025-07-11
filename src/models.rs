@@ -74,9 +74,10 @@ pub struct AcceptCounterOffer {
     pub tx_digest: String,
 }
 
-#[derive(Debug, Clone, Insertable, Serialize, Deserialize)]
+#[derive(Debug, Clone, Queryable, Selectable, Insertable, Serialize, Deserialize)]
 #[diesel(table_name = offers)]
 pub struct Offer {
+    pub id: Option<i32>,
     pub domain_name: String,
     pub buyer: String,
     pub initial_value: String,
@@ -85,6 +86,16 @@ pub struct Offer {
     pub status: OfferStatus,
     pub updated_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    pub last_tx_digest: String,
+}
+
+#[derive(Debug, Clone, AsChangeset, Serialize, Deserialize)]
+#[diesel(table_name = offers)]
+pub struct UpdateOffer {
+    pub value: String,
+    pub owner: Option<String>,
+    pub status: OfferStatus,
+    pub updated_at: DateTime<Utc>,
     pub last_tx_digest: String,
 }
 
@@ -101,7 +112,7 @@ pub enum OfferStatus {
     AcceptedCountered,
 }
 
-impl diesel::serialize::ToSql<crate::schema::sql_types::Offerstatus, diesel::pg::Pg>
+impl diesel::serialize::ToSql<sql_types::Offerstatus, diesel::pg::Pg>
     for OfferStatus
 {
     fn to_sql<'b>(
@@ -123,7 +134,7 @@ impl diesel::serialize::ToSql<crate::schema::sql_types::Offerstatus, diesel::pg:
     }
 }
 
-impl diesel::deserialize::FromSql<crate::schema::sql_types::Offerstatus, diesel::pg::Pg>
+impl diesel::deserialize::FromSql<sql_types::Offerstatus, diesel::pg::Pg>
     for OfferStatus
 {
     fn from_sql(
