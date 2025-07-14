@@ -9,15 +9,16 @@ use async_trait::async_trait;
 use diesel::internal::derives::multiconnection::chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel::{ExpressionMethods, QueryDsl};
-use diesel_async::{AsyncConnection, RunQueryDsl};
+use diesel_async::RunQueryDsl;
 use log::{error, info, warn};
 use std::sync::Arc;
 use sui_indexer_alt_framework::db::{Connection, Db};
-use sui_indexer_alt_framework::pipeline::concurrent::Handler;
+use sui_indexer_alt_framework::pipeline::sequential::Handler;
 use sui_indexer_alt_framework::pipeline::Processor;
 use sui_indexer_alt_framework::types::full_checkpoint_content::CheckpointData;
 use sui_indexer_alt_framework::FieldCount;
 use sui_indexer_alt_framework::Result;
+use sui_types::base_types::SuiAddress;
 use sui_types::event::Event;
 
 #[derive(Clone)]
@@ -97,164 +98,172 @@ impl Processor for OffersHandlerPipeline {
 #[async_trait]
 impl Handler for OffersHandlerPipeline {
     type Store = Db;
+    type Batch = Vec<Self::Value>;
 
-    async fn commit<'a>(values: &[Self::Value], conn: &mut Connection<'a>) -> Result<usize> {
-        if values.is_empty() {
+    fn batch(batch: &mut Self::Batch, values: Vec<Self::Value>) {
+        batch.extend(values);
+    }
+
+    // Execute everything inside a transaction for efficiency and for the fact that if something errors, the whole batch will be reverted to not wind up with invalid data in the database
+    async fn commit<'a>(batch: &Self::Batch, conn: &mut Connection<'a>) -> Result<usize> {
+        if batch.is_empty() {
             return Ok(0);
         }
 
-        let len = values.len();
+        let len = batch.len();
 
         info!("Processing {} offer events", len);
 
-        let values = values.to_vec();
+        for value in batch {
+            match &value.event {
+                OfferEvent::Placed(placed_event) => {
+                    let domain_name = convert_domain_name(&placed_event.domain_name);
 
-        // Execute everything inside a transaction for efficiency and for the fact that if something errors, the whole batch will be reverted to not wind up with invalida data in the database
-        conn.transaction::<_, Error, _>(|conn| {
-            Box::pin(async move {
-                for value in values.iter() {
-                    match &value.event {
-                        OfferEvent::Placed(placed_event) => {
-                            let domain_name = convert_domain_name(&placed_event.domain_name);
+                    diesel::insert_into(offers::table)
+                        .values(vec![Offer {
+                            id: None,
+                            domain_name,
+                            buyer: placed_event.address.to_string(),
+                            initial_value: placed_event.value.to_string(),
+                            value: placed_event.value.to_string(),
+                            owner: None,
+                            status: OfferStatus::Placed,
+                            updated_at: value.created_at,
+                            created_at: value.created_at,
+                            last_tx_digest: value.tx_digest.clone(),
+                        }])
+                        .execute(conn)
+                        .await
+                        .map_err(Into::<Error>::into)?;
+                }
+                OfferEvent::Cancelled(offer_cancelled) => {
+                    let domain_name = convert_domain_name(&offer_cancelled.domain_name);
 
-                            diesel::insert_into(offers::table)
-                                .values(vec![Offer {
-                                    id: None,
-                                    domain_name,
-                                    buyer: placed_event.address.to_string(),
-                                    initial_value: placed_event.value.to_string(),
-                                    value: placed_event.value.to_string(),
-                                    owner: None,
-                                    status: OfferStatus::Placed,
-                                    updated_at: value.created_at,
-                                    created_at: value.created_at,
-                                    last_tx_digest: value.tx_digest.clone(),
-                                }])
-                                .execute(conn)
-                                .await
-                                .map_err(Into::<Error>::into)?;
-                        }
-                        OfferEvent::Cancelled(offer_cancelled) => {
-                            // Mark latest offer for domain_name & buyer combination as cancelled
-                            let domain_name = convert_domain_name(&offer_cancelled.domain_name);
+                    let latest_offer_id =
+                        Self::get_latest_offer_id(conn, &offer_cancelled.address, &domain_name)
+                            .await?;
 
-                            let latest_offer_id =
-                                Self::get_latest_offer_id(conn, &offer_cancelled, &domain_name)
-                                    .await?;
+                    // Then update if found
+                    if let Some(id) = latest_offer_id {
+                        info!(
+                            "Cancelling offer for domain {} and buyer {}",
+                            domain_name, offer_cancelled.address
+                        );
 
-                            // Then update if found
-                            if let Some(id) = latest_offer_id {
-                                info!(
-                                    "Cancelling offer for domain {} and buyer {}",
-                                    domain_name, offer_cancelled.address
-                                );
-
-                                diesel::update(offers::table.filter(offers::id.eq(id)))
-                                    .set(UpdateOffer {
-                                        value: offer_cancelled.value.to_string(),
-                                        owner: None, // won't be updated
-                                        status: OfferStatus::Cancelled,
-                                        updated_at: value.created_at,
-                                        last_tx_digest: value.tx_digest.clone(),
-                                    })
-                                    .execute(conn)
-                                    .await?;
-                            } else {
-                                warn!(
-                                    "Could not find matching offer for domain {} and buyer {}",
-                                    domain_name, offer_cancelled.address
-                                );
-                            }
-                        }
-                        OfferEvent::Accepted(offer_accepted) => {
-                            // TODO:
-
-                            // let domain_name = convert_domain_name(&offer_accepted.domain_name);
-                            //
-                            // diesel::update(
-                            //     offers::table
-                            //         .filter(offers::domain_name.eq(&domain_name))
-                            //         .filter(offers::buyer.eq(&offer_accepted.buyer.to_string()))
-                            //         .order(offers::updated_at.desc())
-                            //         .limit(1),
-                            // )
-                            // .set(UpdateOffer {
-                            //     value: offer_accepted.value.to_string(),
-                            //     owner: Some(offer_accepted.owner.to_string()),
-                            //     status: OfferStatus::Accepted,
-                            //     updated_at: value.created_at,
-                            //     last_tx_digest: value.tx_digest.clone(),
-                            // })
-                            // .execute(conn)
-                            // .await?;
-                        }
-                        OfferEvent::Declined(offer_declined) => {
-                            // let domain_name = convert_domain_name(&offer_declined.domain_name);
-                            //
-                            // diesel::update(
-                            //     offers::table
-                            //         .filter(offers::domain_name.eq(&domain_name))
-                            //         .filter(offers::buyer.eq(&offer_declined.buyer.to_string()))
-                            //         .order(offers::updated_at.desc())
-                            //         .limit(1),
-                            // )
-                            // .set(UpdateOffer {
-                            //     value: offer_declined.value.to_string(),
-                            //     owner: Some(offer_declined.owner.to_string()),
-                            //     status: OfferStatus::Declined,
-                            //     updated_at: value.created_at,
-                            //     last_tx_digest: value.tx_digest.clone(),
-                            // })
-                            // .execute(conn)
-                            // .await?;
-                        }
-                        OfferEvent::MakeCounterOffer(make_counter_offer) => {
-                            // let domain_name = convert_domain_name(&make_counter_offer.domain_name);
-                            //
-                            // diesel::update(
-                            //     offers::table
-                            //         .filter(offers::domain_name.eq(&domain_name))
-                            //         .filter(offers::buyer.eq(&make_counter_offer.buyer.to_string()))
-                            //         .order(offers::updated_at.desc())
-                            //         .limit(1),
-                            // )
-                            // .set(UpdateOffer {
-                            //     value: make_counter_offer.value.to_string(),
-                            //     owner: Some(make_counter_offer.owner.to_string()),
-                            //     status: OfferStatus::Countered,
-                            //     updated_at: value.created_at,
-                            //     last_tx_digest: value.tx_digest.clone(),
-                            // })
-                            // .execute(conn)
-                            // .await?;
-                        }
-                        OfferEvent::AcceptCounterOffer(accept_counter_offer) => {
-                            // let domain_name = convert_domain_name(&accept_counter_offer.domain_name);
-                            //
-                            // diesel::update(
-                            //     offers::table
-                            //         .filter(offers::domain_name.eq(&domain_name))
-                            //         .filter(offers::buyer.eq(&accept_counter_offer.buyer.to_string()))
-                            //         .order(offers::updated_at.desc())
-                            //         .limit(1),
-                            // )
-                            // .set(UpdateOffer {
-                            //     value: accept_counter_offer.value.to_string(),
-                            //     owner: None,
-                            //     status: OfferStatus::AcceptedCountered,
-                            //     updated_at: value.created_at,
-                            //     last_tx_digest: value.tx_digest.clone(),
-                            // })
-                            // .execute(conn)
-                            // .await?;
-                        }
+                        diesel::update(offers::table.filter(offers::id.eq(id)))
+                            .set(UpdateOffer {
+                                value: offer_cancelled.value.to_string(),
+                                owner: None, // won't be updated
+                                status: OfferStatus::Cancelled,
+                                updated_at: value.created_at,
+                                last_tx_digest: value.tx_digest.clone(),
+                            })
+                            .execute(conn)
+                            .await?;
                     }
                 }
+                OfferEvent::Accepted(offer_accepted) => {
+                    let domain_name = convert_domain_name(&offer_accepted.domain_name);
 
-                Ok(())
-            })
-        })
-        .await?;
+                    let latest_offer_id =
+                        Self::get_latest_offer_id(conn, &offer_accepted.buyer, &domain_name)
+                            .await?;
+
+                    if let Some(id) = latest_offer_id {
+                        info!(
+                            "Accepting offer for domain {} and buyer {}, owner {}",
+                            domain_name, offer_accepted.buyer, offer_accepted.owner
+                        );
+
+                        diesel::update(offers::table.filter(offers::id.eq(id)))
+                            .set(UpdateOffer {
+                                value: offer_accepted.value.to_string(),
+                                owner: Some(Some(offer_accepted.owner.to_string())),
+                                status: OfferStatus::Accepted,
+                                updated_at: value.created_at,
+                                last_tx_digest: value.tx_digest.clone(),
+                            })
+                            .execute(conn)
+                            .await?;
+                    }
+                }
+                OfferEvent::Declined(offer_declined) => {
+                    let domain_name = convert_domain_name(&offer_declined.domain_name);
+
+                    let latest_offer_id =
+                        Self::get_latest_offer_id(conn, &offer_declined.buyer, &domain_name)
+                            .await?;
+
+                    if let Some(id) = latest_offer_id {
+                        info!(
+                            "Declined offer for domain {} and buyer {}, owner {}",
+                            domain_name, offer_declined.buyer, offer_declined.owner
+                        );
+
+                        diesel::update(offers::table.filter(offers::id.eq(id)))
+                            .set(UpdateOffer {
+                                value: offer_declined.value.to_string(),
+                                owner: Some(Some(offer_declined.owner.to_string())),
+                                status: OfferStatus::Declined,
+                                updated_at: value.created_at,
+                                last_tx_digest: value.tx_digest.clone(),
+                            })
+                            .execute(conn)
+                            .await?;
+                    }
+                }
+                OfferEvent::MakeCounterOffer(make_counter_offer) => {
+                    let domain_name = convert_domain_name(&make_counter_offer.domain_name);
+
+                    let latest_offer_id =
+                        Self::get_latest_offer_id(conn, &make_counter_offer.buyer, &domain_name)
+                            .await?;
+
+                    if let Some(id) = latest_offer_id {
+                        info!(
+                            "Make counter offer for domain {} and buyer {}, owner {}",
+                            domain_name, make_counter_offer.buyer, make_counter_offer.owner
+                        );
+
+                        diesel::update(offers::table.filter(offers::id.eq(id)))
+                            .set(UpdateOffer {
+                                value: make_counter_offer.value.to_string(),
+                                owner: Some(Some(make_counter_offer.owner.to_string())),
+                                status: OfferStatus::Countered,
+                                updated_at: value.created_at,
+                                last_tx_digest: value.tx_digest.clone(),
+                            })
+                            .execute(conn)
+                            .await?;
+                    }
+                }
+                OfferEvent::AcceptCounterOffer(accept_counter_offer) => {
+                    let domain_name = convert_domain_name(&accept_counter_offer.domain_name);
+
+                    let latest_offer_id =
+                        Self::get_latest_offer_id(conn, &accept_counter_offer.buyer, &domain_name)
+                            .await?;
+
+                    if let Some(id) = latest_offer_id {
+                        info!(
+                            "Accepted counter offer for domain {} and buyer {}",
+                            domain_name, accept_counter_offer.buyer
+                        );
+
+                        diesel::update(offers::table.filter(offers::id.eq(id)))
+                            .set(UpdateOffer {
+                                value: accept_counter_offer.value.to_string(),
+                                owner: None,
+                                status: OfferStatus::AcceptedCountered,
+                                updated_at: value.created_at,
+                                last_tx_digest: value.tx_digest.clone(),
+                            })
+                            .execute(conn)
+                            .await?;
+                    }
+                }
+            }
+        }
 
         Ok(len)
     }
@@ -308,16 +317,25 @@ impl OffersHandlerPipeline {
 
     async fn get_latest_offer_id<'a>(
         conn: &mut Connection<'a>,
-        offer_cancelled: &&OfferCancelledEvent,
+        buyer: &SuiAddress,
         domain_name: &String,
     ) -> Result<Option<i32>> {
-        Ok(offers::table
+        let result = offers::table
             .select(offers::id)
             .filter(offers::domain_name.eq(&domain_name))
-            .filter(offers::buyer.eq(&offer_cancelled.address.to_string()))
+            .filter(offers::buyer.eq(&buyer.to_string()))
             .order(offers::updated_at.desc())
             .first(conn)
             .await
-            .optional()?)
+            .optional()?;
+
+        if result.is_none() {
+            warn!(
+                "Could not find matching offer for domain {} and buyer {}",
+                domain_name, buyer
+            );
+        }
+
+        Ok(result)
     }
 }

@@ -93,7 +93,7 @@ pub struct Offer {
 #[diesel(table_name = offers)]
 pub struct UpdateOffer {
     pub value: String,
-    pub owner: Option<String>,
+    pub owner: Option<Option<String>>,
     pub status: OfferStatus,
     pub updated_at: DateTime<Utc>,
     pub last_tx_digest: String,

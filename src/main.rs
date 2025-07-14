@@ -3,6 +3,7 @@ use log::info;
 use sui_indexer_alt_framework::cluster;
 use sui_indexer_alt_framework::cluster::IndexerCluster;
 use sui_indexer_alt_framework::pipeline::concurrent::ConcurrentConfig;
+use sui_indexer_alt_framework::pipeline::sequential::SequentialConfig;
 use suins_indexer::handlers::offer_events_handler::OfferEventsHandlerPipeline;
 use suins_indexer::handlers::offers_handler::OffersHandlerPipeline;
 use suins_indexer::MIGRATIONS;
@@ -37,7 +38,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     info!("Starting pipeline with handler");
 
-    // Process all offer events and save them to database to separate tables
+    // Process all offer events, in any order, and save them to database to separate tables
     indexer
         .concurrent_pipeline(
             OfferEventsHandlerPipeline::new(args.contract_package_id.clone()),
@@ -45,11 +46,11 @@ async fn main() -> Result<(), anyhow::Error> {
         )
         .await?;
 
-    // Process all offer events and save up to date offer information in database
+    // Process all offer events in order and save up to date offer information in database
     indexer
-        .concurrent_pipeline(
+        .sequential_pipeline(
             OffersHandlerPipeline::new(args.contract_package_id),
-            ConcurrentConfig::default(),
+            SequentialConfig::default(),
         )
         .await?;
 
