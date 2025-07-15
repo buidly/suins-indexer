@@ -322,8 +322,6 @@ impl OfferEventsHandlerPipeline {
     ) -> Result<Option<OfferEventModel>> {
         let event_type = event.type_.to_string();
         if event_type.starts_with(&self.contract_package_id) {
-            info!("Found Auction event: {} ", event_type);
-
             if event_type.ends_with("::OfferPlacedEvent") {
                 let offer_event: OfferPlacedEvent = try_deserialize_event(&event.contents)?;
 

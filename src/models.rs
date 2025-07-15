@@ -77,7 +77,6 @@ pub struct AcceptCounterOffer {
 #[derive(Debug, Clone, Queryable, Selectable, Insertable, Serialize, Deserialize)]
 #[diesel(table_name = offers)]
 pub struct Offer {
-    pub id: Option<i32>,
     pub domain_name: String,
     pub buyer: String,
     pub initial_value: String,
@@ -110,6 +109,54 @@ pub enum OfferStatus {
     Declined,
     Countered,
     AcceptedCountered,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Insertable, Serialize, Deserialize)]
+#[diesel(table_name = auctions)]
+pub struct Auction {
+    pub auction_id: String,
+    pub domain_name: String,
+    pub owner: String,
+    pub start_time: i64,
+    pub end_time: i64,
+    pub min_bid: String,
+    pub winner: Option<String>,
+    pub amount: Option<String>,
+    pub status: AuctionStatus,
+    pub updated_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub last_tx_digest: String,
+}
+
+#[derive(Debug, Clone, AsChangeset, Serialize, Deserialize)]
+#[diesel(table_name = auctions)]
+pub struct UpdateAuction {
+    pub winner: Option<String>,
+    pub amount: Option<String>,
+    pub status: AuctionStatus,
+    pub updated_at: DateTime<Utc>,
+    pub last_tx_digest: String,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Insertable, Serialize, Deserialize)]
+#[diesel(table_name = bids)]
+pub struct Bid {
+    pub auction_id: String,
+    pub domain_name: String,
+    pub bidder: String,
+    pub amount: String,
+    pub created_at: DateTime<Utc>,
+    pub tx_digest: String,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, AsExpression, FromSqlRow, Serialize, Deserialize,
+)]
+#[diesel(sql_type = crate::schema::sql_types::Auctionstatus)]
+pub enum AuctionStatus {
+    Created,
+    Cancelled,
+    Finalized,
 }
 
 impl diesel::serialize::ToSql<sql_types::Offerstatus, diesel::pg::Pg>
@@ -151,6 +198,44 @@ impl diesel::deserialize::FromSql<sql_types::Offerstatus, diesel::pg::Pg>
             "declined" => Ok(OfferStatus::Declined),
             "countered" => Ok(OfferStatus::Countered),
             "accepted-countered" => Ok(OfferStatus::AcceptedCountered),
+            _ => Err("Unrecognized enum variant".into()),
+        }
+    }
+}
+
+impl diesel::serialize::ToSql<sql_types::Auctionstatus, diesel::pg::Pg>
+for AuctionStatus
+{
+    fn to_sql<'b>(
+        &'b self,
+        out: &mut diesel::serialize::Output<'b, '_, diesel::pg::Pg>,
+    ) -> diesel::serialize::Result {
+        let value = match self {
+            AuctionStatus::Created => "created",
+            AuctionStatus::Cancelled => "cancelled",
+            AuctionStatus::Finalized => "finalized",
+        };
+        <str as diesel::serialize::ToSql<diesel::sql_types::Text, diesel::pg::Pg>>::to_sql(
+            value,
+            &mut out.reborrow(),
+        )
+    }
+}
+
+impl diesel::deserialize::FromSql<sql_types::Auctionstatus, diesel::pg::Pg>
+for AuctionStatus
+{
+    fn from_sql(
+        bytes: <diesel::pg::Pg as diesel::backend::Backend>::RawValue<'_>,
+    ) -> diesel::deserialize::Result<Self> {
+        let value = <String as diesel::deserialize::FromSql<
+            diesel::sql_types::Text,
+            diesel::pg::Pg,
+        >>::from_sql(bytes)?;
+        match value.as_str() {
+            "created" => Ok(AuctionStatus::Created),
+            "cancelled" => Ok(AuctionStatus::Cancelled),
+            "finalized" => Ok(AuctionStatus::Finalized),
             _ => Err("Unrecognized enum variant".into()),
         }
     }

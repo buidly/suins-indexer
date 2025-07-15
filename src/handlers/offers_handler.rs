@@ -121,7 +121,6 @@ impl Handler for OffersHandlerPipeline {
 
                     diesel::insert_into(offers::table)
                         .values(vec![Offer {
-                            id: None,
                             domain_name,
                             buyer: placed_event.address.to_string(),
                             initial_value: placed_event.value.to_string(),
@@ -279,30 +278,40 @@ impl OffersHandlerPipeline {
     fn process_event(&self, event: &Event) -> Result<Option<OfferEvent>> {
         let event_type = event.type_.to_string();
         if event_type.starts_with(&self.contract_package_id) {
-            info!("Found Auction event: {} ", event_type);
-
             if event_type.ends_with("::OfferPlacedEvent") {
+                info!("Found Offer event: {} ", event_type);
+
                 let offer_event: OfferPlacedEvent = try_deserialize_event(&event.contents)?;
 
                 return Ok(Some(OfferEvent::Placed(offer_event)));
             } else if event_type.ends_with("::OfferCancelledEvent") {
+                info!("Found Offer event: {} ", event_type);
+
                 let cancel_event: OfferCancelledEvent = try_deserialize_event(&event.contents)?;
 
                 return Ok(Some(OfferEvent::Cancelled(cancel_event)));
             } else if event_type.ends_with("::OfferAcceptedEvent") {
+                info!("Found Offer event: {} ", event_type);
+
                 let accepted_event: OfferAcceptedEvent = try_deserialize_event(&event.contents)?;
 
                 return Ok(Some(OfferEvent::Accepted(accepted_event)));
             } else if event_type.ends_with("::OfferDeclinedEvent") {
+                info!("Found Offer event: {} ", event_type);
+
                 let declined_event: OfferDeclinedEvent = try_deserialize_event(&event.contents)?;
 
                 return Ok(Some(OfferEvent::Declined(declined_event)));
             } else if event_type.ends_with("::MakeCounterOfferEvent") {
+                info!("Found Offer event: {} ", event_type);
+
                 let make_counter_offer_event: MakeCounterOfferEvent =
                     try_deserialize_event(&event.contents)?;
 
                 return Ok(Some(OfferEvent::MakeCounterOffer(make_counter_offer_event)));
             } else if event_type.ends_with("::AcceptCounterOfferEvent") {
+                info!("Found Offer event: {} ", event_type);
+
                 let accept_counter_offer_event: AcceptCounterOfferEvent =
                     try_deserialize_event(&event.contents)?;
 

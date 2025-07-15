@@ -8,6 +8,7 @@ use suins_indexer::handlers::offer_events_handler::OfferEventsHandlerPipeline;
 use suins_indexer::handlers::offers_handler::OffersHandlerPipeline;
 use suins_indexer::MIGRATIONS;
 use url::Url;
+use suins_indexer::handlers::auctions_handler::AuctionsHandlerPipeline;
 
 #[derive(clap::Parser, Debug)]
 struct AppArgs {
@@ -49,7 +50,15 @@ async fn main() -> Result<(), anyhow::Error> {
     // Process all offer events in order and save up to date offer information in database
     indexer
         .sequential_pipeline(
-            OffersHandlerPipeline::new(args.contract_package_id),
+            OffersHandlerPipeline::new(args.contract_package_id.clone()),
+            SequentialConfig::default(),
+        )
+        .await?;
+
+    // Process all auction & bid events in order and save up to date offer information in database
+    indexer
+        .sequential_pipeline(
+            AuctionsHandlerPipeline::new(args.contract_package_id),
             SequentialConfig::default(),
         )
         .await?;
