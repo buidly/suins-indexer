@@ -28,3 +28,10 @@ CREATE TABLE IF NOT EXISTS bids (
     created_at TIMESTAMPTZ NOT NULL,
     tx_digest VARCHAR NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_auctions_domain_name ON auctions(domain_name);
+CREATE INDEX IF NOT EXISTS idx_auctions_owner ON auctions(owner);
+CREATE INDEX IF NOT EXISTS idx_auctions_status ON auctions(status);
+
+CREATE INDEX IF NOT EXISTS idx_bids_domain_name ON bids(domain_name);
+CREATE INDEX IF NOT EXISTS idx_bids_bidder ON bids(bidder);
