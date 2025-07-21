@@ -1,11 +1,14 @@
 use clap::Parser;
+use log::info;
 use sui_indexer_alt_framework::cluster;
 use sui_indexer_alt_framework::cluster::IndexerCluster;
 use sui_indexer_alt_framework::pipeline::concurrent::ConcurrentConfig;
-use suins_indexer::handlers::offer_handler::OfferHandlerPipeline;
+use sui_indexer_alt_framework::pipeline::sequential::SequentialConfig;
+use suins_indexer::handlers::offer_events_handler::OfferEventsHandlerPipeline;
+use suins_indexer::handlers::offers_handler::OffersHandlerPipeline;
 use suins_indexer::MIGRATIONS;
-use log::info;
 use url::Url;
+use suins_indexer::handlers::auctions_handler::AuctionsHandlerPipeline;
 
 #[derive(clap::Parser, Debug)]
 struct AppArgs {
@@ -36,10 +39,27 @@ async fn main() -> Result<(), anyhow::Error> {
 
     info!("Starting pipeline with handler");
 
+    // Process all offer events, in any order, and save them to database to separate tables
     indexer
         .concurrent_pipeline(
-            OfferHandlerPipeline::new(args.contract_package_id),
+            OfferEventsHandlerPipeline::new(args.contract_package_id.clone()),
             ConcurrentConfig::default(),
+        )
+        .await?;
+
+    // Process all offer events in order and save up to date offer information in database
+    indexer
+        .sequential_pipeline(
+            OffersHandlerPipeline::new(args.contract_package_id.clone()),
+            SequentialConfig::default(),
+        )
+        .await?;
+
+    // Process all auction & bid events in order and save up to date offer information in database
+    indexer
+        .sequential_pipeline(
+            AuctionsHandlerPipeline::new(args.contract_package_id),
+            SequentialConfig::default(),
         )
         .await?;
 
