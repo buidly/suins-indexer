@@ -11,7 +11,6 @@ tokio = "1.44.2"
 async-trait = "0.1.88"
 anyhow = "1.0.98"
 serde = "1.0.219"
-serde_json = "1.0.140"
 bcs = "0.1.6"
 clap = { version = "4.5.37", features = ["env", "derive"] }
 diesel = { version = "2.2.7", features = ["postgres", "serde_json"] }
@@ -22,10 +21,8 @@ dotenvy = "0.15"
 log = "0.4"
 env_logger = "0.11"
 
-sui-indexer-alt-framework = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.48.4" }
-move-core-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.48.4" }
-sui-name-service = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.48.4" }
-sui-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.48.4" }
+sui-indexer-alt-framework = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.57.3" }
+sui-types = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.57.3" }
 
 [[bin]]
 name = "suins-indexer"

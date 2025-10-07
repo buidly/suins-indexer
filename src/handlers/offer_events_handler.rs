@@ -15,7 +15,7 @@ use diesel::internal::derives::multiconnection::chrono::{DateTime, Utc};
 use diesel_async::RunQueryDsl;
 use log::{error, info};
 use std::sync::Arc;
-use sui_indexer_alt_framework::db::{Connection, Db};
+use sui_indexer_alt_framework::postgres::{Connection, Db};
 use sui_indexer_alt_framework::pipeline::concurrent::Handler;
 use sui_indexer_alt_framework::pipeline::Processor;
 use sui_indexer_alt_framework::types::full_checkpoint_content::CheckpointData;
